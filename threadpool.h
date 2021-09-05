@@ -88,7 +88,6 @@ bool threadPool<Task>::addTask(Task* task)
         m_taskList.push_back(task);
     }
     m_cv.notify_one();
-    std::cout << "add" << std::endl;
     return true;
 }
 
