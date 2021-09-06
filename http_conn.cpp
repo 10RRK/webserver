@@ -162,26 +162,26 @@ http_conn::LINE_STATUS http_conn::parse_line()
     return LINE_OPEN;   // 如果所有内容分析完毕也没遇到'\r'字符，说明还需要继续读取数据才能进一步分析
 }
 
-// 解析HTTP请求行：获得请求方法，目标URL,以及HTTP版本号
+// 解析HTTP请求行：获得请求方法、目标URL，以及HTTP版本号
 http_conn::HTTP_CODE http_conn::parse_request_line(char* text) 
 {
     // GET /index.html HTTP/1.1
-    m_url = strpbrk(text, " \t"); // 判断第二个参数中的字符哪个在text中最先出现，若没有则返回NULL
+    m_url = strpbrk(text, " \t"); // 判断test中是否包含" \t"中的字符，若没有则返回NULL
     if(!m_url)  
-        return BAD_REQUEST;
+        return BAD_REQUEST;       // 如果请求行中没有' '或'\t'，则HTTP请求必有问题
     // GET\0/index.html HTTP/1.1
-    *m_url++ = '\0';    // 置位空字符，字符串结束符
+    *m_url++ = '\0';              // 置位空字符，字符串结束符
     char* method = text;
     if(strcasecmp(method, "GET") == 0)  // 忽略大小写比较
-        m_method = GET;
-    else                                // 仅支持GET方法
+        m_method = GET;                 // 仅支持GET方法
+    else                                
         return BAD_REQUEST;
+    m_url += strspn(m_url, " \t");  // 检索m_url中第一个不是' '或'\t'的字符的下标
     // /index.html HTTP/1.1
-    // 检索字符串 str1 中第一个不在字符串 str2 中出现的字符下标。
     m_version = strpbrk(m_url, " \t");
     if(!m_version) 
         return BAD_REQUEST;
-    *m_version++ = '\0';
+    *m_version++ = '\0';    // 空格置位为'\0'，m_version定位到版本号的首个字符
     if(strcasecmp(m_version, "HTTP/1.1") != 0)     // 仅支持HTTP/1.1
         return BAD_REQUEST;
     // 检查URL是否合法 http://192.168.186.128:10000/index.html
@@ -201,11 +201,9 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char* text)
 // 解析HTTP请求的头部字段
 http_conn::HTTP_CODE http_conn::parse_headers(char* text) 
 {   
-    // 遇到空行，表示头部字段解析完毕
-    if(text[0] == '\0') 
+    if((*text) == '\0')     // 遇到空行，表示头部字段解析完毕
     {
-        // 如果HTTP请求有消息体，则还需要读取m_content_length字节的消息体，
-        // 状态机转移到CHECK_STATE_CONTENT状态
+        // 如果HTTP请求有消息体，则还需要读取m_content_length字节的消息体，状态机转移到CHECK_STATE_CONTENT状态
         if (m_content_length != 0) 
         {
             m_check_state = CHECK_STATE_CONTENT;
@@ -216,7 +214,7 @@ http_conn::HTTP_CODE http_conn::parse_headers(char* text)
     } 
     else if(strncasecmp(text, "Connection:", 11) == 0) 
     {
-        // 处理Connection 头部字段  Connection: keep-alive
+        // 处理Connection 头部字段  Connection: keep-alive 或 Connection: close
         text += 11;
         text += strspn(text, " \t");    // 检索text中第一个不是' '或'\t'的字符的下标
         if (strcasecmp(text, "keep-alive") == 0) 
@@ -244,9 +242,12 @@ http_conn::HTTP_CODE http_conn::parse_headers(char* text)
 // 我们没有真正解析HTTP请求的消息体，只是判断它是否被完整地读入了
 http_conn::HTTP_CODE http_conn::parse_content(char* text) 
 {
+    /* 解析HTTP请求行和头部字段时，都是先调用parse_line()使得m_checked_idx移动到
+       当前正要解析的这一行的末尾，再调用parse_request_line或parse_headers，而
+       对于HTTP请求体，并没有调用parse_line()，所以m_checked_idx仍在这一行开头 */
     if(m_read_idx >= (m_content_length + m_checked_idx))
     {
-        text[m_content_length] = '\0';
+        text[m_content_length] = '\0';  // m_content_length是解析HTTP请求头部字段得到的
         return GET_REQUEST;
     }
     return NO_REQUEST;
@@ -288,43 +289,43 @@ http_conn::HTTP_CODE http_conn::process_read()
                 ret = parse_content(text);
                 if (ret == GET_REQUEST) 
                     return do_request();
-                line_status = LINE_OPEN;
+                line_status = LINE_OPEN;    // 如果ret==NO_REQUEST，则说明要继续读取后面的行
                 break;
             }
             default: 
                 return INTERNAL_ERROR;      // 服务器内部错误
         }
     }
-    return NO_REQUEST;
+    return NO_REQUEST;  // 如果所有数据解析完毕但没有返回结果，说明请求不完整
 }
 
-// 当得到一个完整、正确的HTTP请求时，我们就分析目标文件的属性，
-// 如果目标文件存在、对所有用户可读，且不是目录，则使用mmap将其
-// 映射到内存地址m_file_address处，并告诉调用者获取文件成功
+/* 当得到一个完整、正确的HTTP请求时，我们就分析目标文件的属性。如果目标文件存在、
+   对所有用户可读，且不是目录，则使用mmap将其映射到内存地址m_file_address处，
+   并告诉调用者获取文件成功 */
 http_conn::HTTP_CODE http_conn::do_request()
 {
-    // "/home/mirai/Project/web/resources"
-    strcpy(m_real_file, doc_root);
+    // "/home/mirai/Project/web/resources"与"/index.html"拼接到一起
+    strcpy(m_real_file, doc_root);  // 将网站的根目录赋值给m_real_file
     int len = strlen(doc_root);
-    strncpy(m_real_file + len, m_url, FILENAME_LEN - len - 1);
+    strncpy(m_real_file + len, m_url, FILENAME_LEN - len - 1);  // 将m_url赋值给m_real_file
     // 获取m_real_file文件的相关的状态信息，-1失败，0成功
-    if(stat(m_real_file, &m_file_stat) < 0) 
+    if(stat(m_real_file, &m_file_stat) < 0)     // m_file_stat为传出参数，用于保存获取到的文件的信息
         return NO_RESOURCE;
 
     // 判断访问权限
-    if(!(m_file_stat.st_mode & S_IROTH)) 
-        return FORBIDDEN_REQUEST;
+    if(!(m_file_stat.st_mode & S_IROTH))    // S_IROTH为is read others，即其他用户是否有读权限
+        return FORBIDDEN_REQUEST;       // 客户对资源没有足够的访问权限
 
     // 判断是否是目录
     if(S_ISDIR(m_file_stat.st_mode)) 
-        return BAD_REQUEST;
+        return BAD_REQUEST;     // 用户请求语法错误（请求访问的文件不能是目录）
 
     // 以只读方式打开文件
     int fd = open(m_real_file, O_RDONLY);
-    // 创建内存映射
+    // 创建内存映射  st_size为文件字节数（文件大小）  返回值是一个内存地址（网站数据映射到了地址处）
     m_file_address = (char*)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    return FILE_REQUEST;
+    return FILE_REQUEST;        // 文件请求，获取文件成功
 }
 
 // 对内存映射区执行munmap操作
@@ -333,7 +334,7 @@ void http_conn::unmap()
     if(m_file_address)
     {
         munmap(m_file_address, m_file_stat.st_size);    // 释放由mmap创建的内存空间
-        m_file_address = 0;
+        m_file_address = NULL;
     }
 }
 
