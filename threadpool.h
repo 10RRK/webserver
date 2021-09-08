@@ -30,7 +30,7 @@ private:
        文件描述符可能会被复用，即同一对象会被重复使用，因为对象执行完process方法后还会再write，即使响应结束下一次
        请求可能还是用这个对象。
            如果用shared_ptr管理内存，当某一Task执行完毕而被m_taskList.pop_back()后，这个Task对象会被释放，如果这个
-       对象再次被用到时，会出错而崩溃 */
+       对象再次被用到时，会出错而崩溃。如果main函数中的对象也由shared_ptr接管则可以用shared_ptr */
     std::list<Task*> m_taskList;  // 任务队列
     std::mutex m_mutex;    // 保护任务队列和条件变量的互斥锁 
     std::condition_variable m_cv;   // 是否有任务需要处理   

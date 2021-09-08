@@ -87,6 +87,9 @@ void http_conn::init()
     bzero(m_read_buf, READ_BUFFER_SIZE);
     bzero(m_write_buf, READ_BUFFER_SIZE);
     bzero(m_real_file, FILENAME_LEN);
+
+    m_bytes_have_send = 0;
+    m_bytes_to_send = 0; 
 }
 
 // 关闭连接；从epoll中移除监听的文件描述符，成员变量修改等
@@ -112,7 +115,7 @@ bool http_conn::read()
         bytes_read = recv(m_sockfd, m_read_buf+m_read_idx, READ_BUFFER_SIZE-m_read_idx, 0);
         if(bytes_read == -1) 
         {                                        // addfd设置了socketfd为非阻塞
-            if(errno == EAGAIN || errno == EWOULDBLOCK)  // 没有数据
+            if(errno == EAGAIN || errno == EWOULDBLOCK)  // 没有数据。对于非阻塞IO，下面的条件成立表示数据已经全部读取完毕
                 break;              // Linux上EAGAIN和EWOULDBLOCK的值相同
             return false;   
         } 
@@ -281,15 +284,15 @@ http_conn::HTTP_CODE http_conn::process_read()
                 if (ret == BAD_REQUEST) 
                     return BAD_REQUEST;
                 else if (ret == GET_REQUEST) 
-                    return do_request();
-                break;
+                    return do_request();    // 如果没有请求体，则解析完头部就查找客户端请求的目标文件
+                break;                         
             }
             case CHECK_STATE_CONTENT:       // 第三个状态，解析请求体
             {
                 ret = parse_content(text);
-                if (ret == GET_REQUEST) 
+                if (ret == GET_REQUEST)     // 有请求体的情况下，解析完请求体再查找客户端请求的目标文件
                     return do_request();
-                line_status = LINE_OPEN;    // 如果ret==NO_REQUEST，则说明要继续读取后面的行
+                line_status = LINE_OPEN;    // 如果ret== NO_REQUEST，则说明要继续读取后面的行
                 break;
             }
             default: 
@@ -322,8 +325,11 @@ http_conn::HTTP_CODE http_conn::do_request()
 
     // 以只读方式打开文件
     int fd = open(m_real_file, O_RDONLY);
-    // 创建内存映射  st_size为文件字节数（文件大小）  返回值是一个内存地址（网站数据映射到了地址处）
-    m_file_address = (char*)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    /* 创建内存映射 NULL表示地址由内核指定 st_size为文件字节数（文件大小） PROT_READ内存段可读权限   
+       MAP_PRIVATE内存段为调用内存私有，对该内存段的修改不会反映到被映射的文件中（会重新创建一个新文件）
+       offset为0，从文件起始地址开始映射 返回值是一个内存地址（网站数据映射到了地址处） */
+    // 当频繁对一个文件进行读取操作时，mmap会比read高效些
+    m_file_address = (char*)mmap(NULL, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     return FILE_REQUEST;        // 文件请求，获取文件成功
 }
@@ -338,18 +344,16 @@ void http_conn::unmap()
     }
 }
 
-// 写HTTP响应
+// 写HTTP响应  返回值代表是否要继续保持连接
 bool http_conn::write()
 {
     int temp = 0;
-    int bytes_have_send = 0;    // 已经发送的字节
-    int bytes_to_send = m_write_idx;  // m_write_idx为写缓冲区中待发送的字节数
     
-    if(bytes_to_send == 0) 
+    if(m_bytes_to_send == 0) 
     {
         // 将要发送的字节为0，这一次响应结束。
         modfd(m_epollfd, m_sockfd, EPOLLIN);    // 监听事件修改为EPOLLIN
-        init();
+        init();         // 对象数据清零
         return true;
     }
 
@@ -357,65 +361,85 @@ bool http_conn::write()
     {
         // 集中写（将多块分散的内存数据一并写入文件描述符中）
         temp = writev(m_sockfd, m_iv, m_iv_count);  // 函数成功时返回写入fd的字节数
-        if (temp <= -1) 
+        if (temp < 0) 
         {
             /* 如果TCP写缓冲没有空间，则等待下一轮EPOLLOUT事件，虽然在此期间，
                服务器无法立即接收到同一客户的下一个请求，但可以保证连接的完整性。 */
-            if(errno == EAGAIN) 
+            if(errno == EAGAIN | errno == EWOULDBLOCK) 
             {
                 modfd(m_epollfd, m_sockfd, EPOLLOUT);
                 return true;
             }
-            unmap();    // 对内存映射区执行munmap操作
+            unmap();    // 释放内存映射
             return false;
         }
-        bytes_to_send -= temp;
-        bytes_have_send += temp;
-        if(bytes_to_send <= bytes_have_send) 
+        m_bytes_to_send -= temp;
+        m_bytes_have_send += temp;
+
+        if(m_bytes_to_send <= 0) 
         {
             // 发送HTTP响应成功，根据HTTP请求中的Connection字段决定是否立即关闭连接
             unmap();
+            modfd(m_epollfd, m_sockfd, EPOLLIN);
             if(m_linger) 
             {
                 init();
-                modfd(m_epollfd, m_sockfd, EPOLLIN);
                 return true;
             } 
             else 
             {
-                modfd(m_epollfd, m_sockfd, EPOLLIN);
                 return false;
             } 
+        }
+        else
+        {          
+            // 如果没有发送完毕，还要修改下次写数据的位置
+            if (m_iv_count == 2 && (m_bytes_have_send >= m_iv[0].iov_len))
+            {
+                m_iv[0].iov_len = 0;
+                m_iv[1].iov_base = m_file_address + (m_bytes_have_send - m_write_idx);
+                m_iv[1].iov_len = m_bytes_to_send;
+            }
+            else if(m_iv_count == 2 || m_iv_count == 1)
+            {
+                m_iv[0].iov_base = m_write_buf + m_bytes_have_send;
+                m_iv[0].iov_len = m_iv[0].iov_len - temp;
+            }
+            else 
+                return false;
         }
     }
 }
 
-// 往写缓冲中写入待发送的数据
+// 往写缓冲区中写入待发送的数据
 bool http_conn::add_response(const char* format, ...) 
 {
-    if(m_write_idx >= WRITE_BUFFER_SIZE) 
+    if(m_write_idx >= WRITE_BUFFER_SIZE)    // 若写缓冲区已满，则不再写入
         return false;
-    va_list arg_list;
-    va_start(arg_list, format);
+    va_list arg_list;   // VA_LIST 是在C语言中解决可变参数问题的一组宏
+    va_start(arg_list, format);     // 用VA_START宏初始化变量刚定义的VA_LIST变量
+    /* 用于向字符串中打印数据、数据格式用户自定义
+       int _vsnprintf(char* str, size_t size, const char* format, va_list ap);
+       执行成功，返回最终生成字符串的长度 */
     int len = vsnprintf(m_write_buf + m_write_idx, WRITE_BUFFER_SIZE - 1 - m_write_idx, format, arg_list);
     if(len >= (WRITE_BUFFER_SIZE - 1 - m_write_idx)) 
         return false;
     m_write_idx += len;
-    va_end(arg_list);
+    va_end(arg_list);       // 最后用VA_END宏结束可变参数的获取
     return true;
 }
 
-bool http_conn::add_status_line( int status, const char* title ) 
+bool http_conn::add_status_line( int status, const char* title )    // status为HTTP状态码  title为状态信息
 {
     return add_response("%s %d %s\r\n", "HTTP/1.1", status, title);
 }
 
 bool http_conn::add_headers(int content_len) 
 {
-    add_content_length(content_len);
-    add_content_type();
-    add_linger();
-    add_blank_line();
+    add_content_length(content_len);    // 输出响应内容的长度
+    add_content_type();     // 输出响应内容的类型（这里仅为文本类型）
+    add_linger();           // 输出是否为连接状态
+    add_blank_line();       // HTTP应答必须包含一个空行以标识头部字段的结束
 }
 
 bool http_conn::add_content_length(int content_len) 
@@ -448,11 +472,11 @@ bool http_conn::process_write(HTTP_CODE ret)
 {
     switch(ret)
     {
-        case INTERNAL_ERROR:
+        case INTERNAL_ERROR:      
             add_status_line(500, error_500_title);
-            add_headers(strlen(error_500_form));
-            if (!add_content(error_500_form)) 
-                return false;
+            add_headers(strlen(error_500_form));    // 输出HTTP响应头部字段
+            if (!add_content(error_500_form))       // 输出HTTP响应内容
+                return false;                       // 如果写缓冲区已满则返回false
             break;
         case BAD_REQUEST:
             add_status_line(400, error_400_title);
@@ -462,7 +486,7 @@ bool http_conn::process_write(HTTP_CODE ret)
             break;
         case NO_RESOURCE:
             add_status_line(404, error_404_title);
-            add_headers( strlen(error_404_form));
+            add_headers(strlen(error_404_form));
             if (!add_content(error_404_form)) 
                 return false;
             break;
@@ -472,21 +496,23 @@ bool http_conn::process_write(HTTP_CODE ret)
             if (!add_content(error_403_form)) 
                 return false;
             break;
-        case FILE_REQUEST:
+        case FILE_REQUEST:         // 客户端请求为文件请求，且获取文件成功（文件已通过内存映射读取到）
             add_status_line(200, ok_200_title);
-            add_headers(m_file_stat.st_size);
-            m_iv[0].iov_base = m_write_buf;
+            add_headers(m_file_stat.st_size);   // 对于200状态的响应，响应头部写入了m_write_buf中
+            m_iv[0].iov_base = m_write_buf; 
             m_iv[0].iov_len = m_write_idx;
-            m_iv[1].iov_base = m_file_address;
+            m_iv[1].iov_base = m_file_address;  // 对于200状态的响应，响应内容在m_file_address中
             m_iv[1].iov_len = m_file_stat.st_size;
+            m_bytes_to_send = m_write_idx + m_file_stat.st_size;
             m_iv_count = 2;
             return true;
         default:
             return false;
     }
 
-    m_iv[0].iov_base = m_write_buf;
+    m_iv[0].iov_base = m_write_buf; // 对于非200状态的响应，响应头部和响应内容都写入了m_write_buf中
     m_iv[0].iov_len = m_write_idx;
+    m_bytes_to_send = m_write_idx;
     m_iv_count = 1;
     return true;
 }
@@ -496,15 +522,15 @@ void http_conn::process()
 {
     // 解析HTTP请求
     HTTP_CODE read_ret = process_read();
-    if(read_ret == NO_REQUEST) 
+    if(read_ret == NO_REQUEST)      // 如果解析到的请求不完整，则监听EPOLLIN事件，等待下一次读取客户端输入
     {
         modfd(m_epollfd, m_sockfd, EPOLLIN);
         return;
     }
     
     // 生成响应
-    bool write_ret = process_write(read_ret);
-    if(!write_ret) 
-        close_conn();
+    bool write_ret = process_write(read_ret);   // 如果写缓冲区满或写入错误，返回false
+    if(!write_ret)          // 如果写入错误，就关闭连接，相当于把这次请求丢弃
+        close_conn();       // m_sockfd会被置为-1表示已关闭
     modfd(m_epollfd, m_sockfd, EPOLLOUT);
 }

@@ -90,18 +90,22 @@ int main(int argc, char* argv[])
             {
                 struct sockaddr_in client_address;  // 用于获取被接受连接的远端socket地址
                 socklen_t client_addrlength = sizeof(client_address);   // 客户端socket地址的长度
-                int connfd = accept(listenfd, (struct sockaddr*)&client_address, &client_addrlength);   // 从listen监听队列中接受一个连接;成功时返回一个新的连接socket          
-                if (connfd < 0)     // accept失败时返回-1并设置errno
-                {
-                    printf("errno is: %d\n", errno);
-                    continue;
-                } 
-                if(http_conn::m_user_count >= MAX_FD)   // 目前支持的连接数满了
-                {
-                    close(connfd);
-                    continue;
+                while(1) 
+                {    
+                    int connfd = accept(listenfd, (struct sockaddr*)&client_address, &client_addrlength);   // 从listen监听队列中接受一个连接;成功时返回一个新的连接socket
+                    if (connfd < 0)     
+                    {
+                        if(!(errno == EAGAIN || errno == EWOULDBLOCK))  // 没有数据。对于非阻塞IO，下面的条件成立表示数据已经全部读取完毕
+                            printf("errno is: %d\n", errno);
+                        break;
+                    }
+                    if(http_conn::m_user_count >= MAX_FD)   // 目前支持的连接数满了
+                    {
+                        close(connfd);
+                        break;
+                    }
+                    users[connfd].init(connfd, client_address); // 初始化客户连接（包含向epoll添加connfd文件描述符的操作，成员变量的初始化等）
                 }
-                users[connfd].init(connfd, client_address); // 初始化客户连接（包含向epoll添加connfd文件描述符的操作，成员变量的初始化等）
             } 
             else if(events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))  // TCP连接被对方关闭或对方关闭了写操作，挂起，错误
             {
